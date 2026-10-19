@@ -24,6 +24,7 @@
 #include <Mfidl.h>
 #include <optional>
 #include <limits>
+#include <cmath>
 #include "Helper.h"
 #include "Times.h"
 #include "resource.h"
@@ -683,6 +684,10 @@ void CDX11VideoProcessor::ReleaseVP()
 	m_TexConvertOutput.Release();
 	m_TexResize.Release();
 	m_TexsPostScale.Release();
+	m_AmbilightFrame.Release();
+	for (auto& texture : m_AmbilightLevels) texture.Release();
+	for (auto& texture : m_AmbilightWork) texture.Release();
+	m_AmbilightFailed = false;
 
 	m_PSConvColorData.Release();
 	m_pDoviCurvesConstantBuffer.Release();
@@ -736,6 +741,10 @@ void CDX11VideoProcessor::ReleaseDevice()
 
 	m_pCorrectionConstants.Release();
 	m_pPostScaleConstants.Release();
+	m_pAmbilightBlur.Release();
+	m_pAmbilightComposite.Release();
+	m_pAmbilightDownsample.Release();
+	m_pAmbilightConstants.Release();
 
 	m_pHDR10ToneMappingConstants.Release();
 	m_pDoViDynamicConstants.Release();
@@ -2950,6 +2959,128 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 	return hr;
 }
 
+HRESULT CDX11VideoProcessor::DrawAmbilight(ID3D11Texture2D* target)
+{
+	const auto& settings = m_pFilter->m_Ambilight;
+	if (!settings.enabled || !settings.intensity || m_AmbilightFailed || SourceIsHDR()
+			|| m_bVPUseRTXVideoHDR || m_bHdrDisplayModeEnabled || m_pPSHalfOUtoInterlace) {
+		return S_FALSE;
+	}
+	D3D11_TEXTURE2D_DESC desc;
+	target->GetDesc(&desc);
+	const CRect screen(0, 0, desc.Width, desc.Height);
+	CRect video;
+	video.IntersectRect(screen, m_videoRect);
+	if (video.IsRectEmpty() || video == screen) return S_FALSE;
+
+	// Latch errors until media/device reinitialization, avoiding per-frame retries.
+	auto fail = [&](HRESULT hr) {
+		m_AmbilightFailed = true;
+		DLog(L"Ambilight disabled for this session: {}", HR2Str(hr));
+		return hr;
+	};
+	if (!m_pAmbilightBlur || !m_pAmbilightComposite || !m_pAmbilightDownsample) {
+		auto compile = [&](const char* source, CComPtr<ID3D11PixelShader>& shader) {
+			CComPtr<ID3DBlob> code;
+			HRESULT hr = CompileShader(source, nullptr, "ps_4_0", &code);
+			if (SUCCEEDED(hr)) hr = m_pDevice->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader);
+			return hr;
+		};
+		HRESULT hr = compile(AmbilightBlurShader, m_pAmbilightBlur);
+		if (FAILED(hr)) return fail(hr);
+		hr = compile(AmbilightCompositeShader, m_pAmbilightComposite);
+		if (FAILED(hr)) return fail(hr);
+		hr = compile(AmbilightDownsampleShader, m_pAmbilightDownsample);
+		if (FAILED(hr)) return fail(hr);
+	}
+	if (!m_pAmbilightConstants) {
+		D3D11_BUFFER_DESC buffer = {};
+		buffer.ByteWidth = 64;
+		buffer.Usage = D3D11_USAGE_DEFAULT;
+		buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		HRESULT hr = m_pDevice->CreateBuffer(&buffer, nullptr, &m_pAmbilightConstants);
+		if (FAILED(hr)) return fail(hr);
+	}
+	HRESULT hr = m_AmbilightFrame.CheckCreate(m_pDevice, desc.Format, desc.Width, desc.Height, Tex2D_DefaultShader);
+	if (FAILED(hr)) return fail(hr);
+	const float blurLevel = settings.blur / 25.0f;
+	const int lowerLevel = (int)blurLevel;
+	const int upperLevel = std::min(4, (int)std::ceil(blurLevel));
+	for (int level = 0; level <= upperLevel; ++level) {
+		// FP16 avoids repeated 8-bit quantization in the blur pyramid.
+		hr = m_AmbilightLevels[level].CheckCreate(m_pDevice, DXGI_FORMAT_R16G16B16A16_FLOAT, 256 >> level, 144 >> level, Tex2D_DefaultShaderRTarget);
+		if (FAILED(hr)) return fail(hr);
+		if (level) {
+			hr = m_AmbilightWork[level].CheckCreate(m_pDevice, DXGI_FORMAT_R16G16B16A16_FLOAT, 256 >> level, 144 >> level, Tex2D_DefaultShaderRTarget);
+			if (FAILED(hr)) return fail(hr);
+		}
+	}
+
+	// The source contains the current processed video, without subtitles or OSD.
+	m_pDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+	m_pDeviceContext->CopyResource(m_AmbilightFrame.pTexture, target);
+	auto draw = [&](const Tex2D_t& source, ID3D11Texture2D* dest,
+			const CRect& src, const CRect& dst, ID3D11PixelShader* shader, const float* constants) {
+		CComPtr<ID3D11RenderTargetView> view;
+		HRESULT result = m_pDevice->CreateRenderTargetView(dest, nullptr, &view);
+		if (FAILED(result)) return result;
+		result = FillVertexBuffer(m_pDeviceContext, m_pVertexBuffer, source.desc.Width, source.desc.Height, src, 0, false);
+		if (FAILED(result)) return result;
+		if (constants) m_pDeviceContext->UpdateSubresource(m_pAmbilightConstants, 0, nullptr, constants, 0, 0);
+		D3D11_VIEWPORT viewport = { (FLOAT)dst.left, (FLOAT)dst.top, (FLOAT)dst.Width(), (FLOAT)dst.Height(), 0, 1 };
+		TextureBlt11(m_pDeviceContext, view, viewport, m_pVSimpleInputLayout, m_pVS_Simple,
+			shader, source.pShaderResource, m_pSamplerLinear, constants ? m_pAmbilightConstants.p : nullptr, m_pVertexBuffer);
+		return S_OK;
+	};
+	float constants[16] = {};
+	for (int level = 0; level <= upperLevel; ++level) {
+		auto& output = m_AmbilightLevels[level];
+		const auto& input = level ? m_AmbilightLevels[level - 1] : m_AmbilightFrame;
+		const CRect src = level ? CRect(0, 0, input.desc.Width, input.desc.Height) : video;
+		const CRect dst(0, 0, output.desc.Width, output.desc.Height);
+		constants[0] = 0.25f * src.Width() / (input.desc.Width * (float)dst.Width());
+		constants[1] = 0.25f * src.Height() / (input.desc.Height * (float)dst.Height());
+		constants[2] = level ? 0.0f : 1.0f; // decode SDR to linear light once
+		hr = draw(input, output.pTexture, src, dst, m_pAmbilightDownsample, constants);
+		if (FAILED(hr)) return fail(hr);
+		if (level) {
+			// Dense Gaussian taps at every level: no sparse sampling grid.
+			constants[0] = 1.0f / dst.Width();
+			constants[1] = 0;
+			constants[2] = 0;
+			hr = draw(output, m_AmbilightWork[level].pTexture, dst, dst, m_pAmbilightBlur, constants);
+			if (FAILED(hr)) return fail(hr);
+			constants[0] = 0;
+			constants[1] = 1.0f / dst.Height();
+			hr = draw(m_AmbilightWork[level], output.pTexture, dst, dst, m_pAmbilightBlur, constants);
+			if (FAILED(hr)) return fail(hr);
+		}
+	}
+	constants[0] = settings.intensity / 100.0f;
+	constants[1] = std::min(video.Width(), video.Height()) * settings.spread / 100.0f;
+	constants[2] = std::min(settings.fadeStart, 99) / 100.0f;
+	constants[3] = settings.fadeCurve / 35.0f;
+	constants[4] = (float)video.left;
+	constants[5] = (float)video.top;
+	constants[6] = (float)video.right;
+	constants[7] = (float)video.bottom;
+	constants[8] = settings.brightness / 100.0f;
+	constants[9] = settings.contrast / 100.0f;
+	constants[10] = settings.saturation / 100.0f;
+	constants[11] = settings.vibrance / 100.0f;
+	constants[12] = settings.edge / 100.0f;
+	constants[13] = (float)settings.directions;
+	constants[14] = settings.debanding / 100.0f;
+	constants[15] = blurLevel - lowerLevel;
+	if (!settings.spread) constants[0] = 0;
+	m_pDeviceContext->PSSetShaderResources(1, 1, &m_AmbilightLevels[upperLevel].pShaderResource.p);
+	const CRect reducedRect(0, 0, m_AmbilightLevels[lowerLevel].desc.Width, m_AmbilightLevels[lowerLevel].desc.Height);
+	hr = draw(m_AmbilightLevels[lowerLevel], target, reducedRect, screen, m_pAmbilightComposite, constants);
+	ID3D11ShaderResourceView* nullView = nullptr;
+	m_pDeviceContext->PSSetShaderResources(1, 1, &nullView);
+	return FAILED(hr) ? fail(hr) : S_OK;
+}
+
 HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTime)
 {
 	CheckPointer(m_TexSrcVideo.pTexture, E_FAIL);
@@ -3082,6 +3213,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 	if (!m_renderRect.IsRectEmpty()) {
 		hr = Process(pBackBuffer, m_srcRect, m_videoRect, m_FieldDrawn == 2);
+		if (SUCCEEDED(hr)) {
+			// Failure of this optional effect must never stop playback.
+			DrawAmbilight(pBackBuffer);
+		}
 	}
 
 	if (!m_pPSHalfOUtoInterlace) {

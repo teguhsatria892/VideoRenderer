@@ -33,7 +33,7 @@
 
 #define WM_SWITCH_FULLSCREEN (WM_APP + 0x1000)
 
-#define OPT_REGKEY_VIDEORENDERER           L"Software\\MPC-BE Filters\\MPC Video Renderer"
+#define OPT_REGKEY_VIDEORENDERER           L"Software\\MPC-BE Filters\\MPC Video Renderer Ambilight"
 #define OPT_UseD3D11                       L"UseD3D11"
 #define OPT_ShowStatistics                 L"ShowStatistics"
 #define OPT_ResizeStatistics               L"ResizeStatistics"
@@ -186,6 +186,12 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 	CRegKey key;
 	if (ERROR_SUCCESS == key.Open(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER, KEY_READ)) {
 		DWORD dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(L"AmbilightEnabled", dw)) m_Ambilight.enabled = !!dw;
+		for (const auto& definition : AmbilightSettingDefinitions) {
+			if (ERROR_SUCCESS == key.QueryDWORDValue(CA2W(definition.key), dw)) {
+				m_Ambilight.*(definition.member) = std::clamp((int)dw, definition.minimum, definition.maximum);
+			}
+		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_UseD3D11, dw)) {
 			m_Sets.bUseD3D11 = !!dw;
 		}
@@ -1320,6 +1326,10 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 {
 	CRegKey key;
 	if (ERROR_SUCCESS == key.Create(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER)) {
+		key.SetDWORDValue(L"AmbilightEnabled", m_Ambilight.enabled);
+		for (const auto& definition : AmbilightSettingDefinitions) {
+			key.SetDWORDValue(CA2W(definition.key), m_Ambilight.*(definition.member));
+		}
 		key.SetDWORDValue(OPT_UseD3D11,            m_Sets.bUseD3D11);
 		key.SetDWORDValue(OPT_ShowStatistics,      m_Sets.bShowStats);
 		key.SetDWORDValue(OPT_ResizeStatistics,    m_Sets.iResizeStats);
@@ -1384,6 +1394,11 @@ STDMETHODIMP CMpcVideoRenderer::SetCallback11(ISubRender11Callback* cb)
 STDMETHODIMP CMpcVideoRenderer::Flt_GetBool(LPCSTR field, bool* value)
 {
 	CheckPointer(value, E_POINTER);
+	if (!strcmp(field, "ambilightEnabled")) {
+		CAutoLock lock(&m_RendererLock);
+		*value = m_Ambilight.enabled;
+		return S_OK;
+	}
 
 	if (!strcmp(field, "statsEnable")) {
 		*value = m_Sets.bShowStats;
@@ -1407,6 +1422,11 @@ STDMETHODIMP CMpcVideoRenderer::Flt_GetBool(LPCSTR field, bool* value)
 STDMETHODIMP CMpcVideoRenderer::Flt_GetInt(LPCSTR field, int* value)
 {
 	CheckPointer(value, E_POINTER);
+	if (const auto* definition = FindAmbilightSetting(field)) {
+		CAutoLock lock(&m_RendererLock);
+		*value = m_Ambilight.*(definition->member);
+		return S_OK;
+	}
 
 	if (!strcmp(field, "renderType")) {
 		if (m_inputMT.IsValid()) {
@@ -1470,6 +1490,24 @@ STDMETHODIMP CMpcVideoRenderer::Flt_GetBin(LPCSTR field, LPVOID* value, unsigned
 
 STDMETHODIMP CMpcVideoRenderer::Flt_SetBool(LPCSTR field, bool value)
 {
+	if (!strcmp(field, "ambilightSave") && value) {
+		CAutoLock lock(&m_RendererLock);
+		CRegKey key;
+		if (ERROR_SUCCESS != key.Create(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER)) return E_FAIL;
+		key.SetDWORDValue(L"AmbilightEnabled", m_Ambilight.enabled);
+		for (const auto& definition : AmbilightSettingDefinitions) {
+			key.SetDWORDValue(CA2W(definition.key), m_Ambilight.*(definition.member));
+		}
+		return S_OK;
+	}
+	if (!strcmp(field, "ambilightEnabled")) {
+		{
+			CAutoLock lock(&m_RendererLock);
+			m_Ambilight.enabled = value;
+		}
+		if (m_filterState != State_Running) Redraw();
+		return S_OK;
+	}
 	if (!strcmp(field, "cmd_redraw") && value) {
 		Redraw();
 		return S_OK;
@@ -1527,6 +1565,15 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetBool(LPCSTR field, bool value)
 
 STDMETHODIMP CMpcVideoRenderer::Flt_SetInt(LPCSTR field, int value)
 {
+	if (const auto* definition = FindAmbilightSetting(field)) {
+		if (value < definition->minimum || value > definition->maximum) return E_INVALIDARG;
+		{
+			CAutoLock lock(&m_RendererLock);
+			m_Ambilight.*(definition->member) = value;
+		}
+		if (m_filterState != State_Running) Redraw();
+		return S_OK;
+	}
 	if (!strcmp(field, "rotation")) {
 		// Allowed angles are multiples of 90.
 		if (value % 90 == 0) {

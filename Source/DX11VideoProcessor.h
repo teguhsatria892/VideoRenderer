@@ -167,6 +167,11 @@ private:
 	std::vector<ExternalPixelShader11_t> m_pPreScaleShaders;
 	std::vector<ExternalPixelShader11_t> m_pPostScaleShaders;
 	CComPtr<ID3D11Buffer> m_pPostScaleConstants;
+	Tex2D_t m_AmbilightFrame, m_AmbilightLevels[5], m_AmbilightWork[5];
+	CComPtr<ID3D11PixelShader> m_pAmbilightBlur, m_pAmbilightComposite, m_pAmbilightDownsample;
+	CComPtr<ID3D11Buffer> m_pAmbilightConstants;
+	bool m_AmbilightFailed = false;
+	HRESULT DrawAmbilight(ID3D11Texture2D* target);
 	CComPtr<ID3D11PixelShader> m_pPSHalfOUtoInterlace;
 	CComPtr<ID3D11PixelShader> m_pPSFinalPass;
 

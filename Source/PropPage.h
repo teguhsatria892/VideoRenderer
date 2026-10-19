@@ -21,6 +21,7 @@
 #pragma once
 
 #include "IVideoRenderer.h"
+#include <FilterInterfaces.h>
 
 // CVRMainPPage
 
@@ -28,6 +29,7 @@ class __declspec(uuid("DA46D181-07D6-441D-B314-019AEB10148A"))
 	CVRMainPPage : public CBasePropertyPage, public CWindow
 {
 	CComQIPtr<IVideoRenderer> m_pVideoRenderer;
+	CComQIPtr<IExFilterConfig> m_pAmbilightConfig;
 
 	Settings_t m_SetsPP;
 

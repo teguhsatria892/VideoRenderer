@@ -3,6 +3,9 @@
 // Used by MpcVideoRenderer.rc
 //
 #define IDD_MAINPROPPAGE                102
+#define IDC_AMBILIGHT_ENABLE             1100
+#define IDC_AMBILIGHT_INTENSITY          1101
+#define IDC_AMBILIGHT_BLUR               1102
 #define IDD_INFOPROPPAGE                103
 #define IDS_MAINPROPPAGE_TITLE          104
 #define IDS_INFOPROPPAGE_TITLE          105

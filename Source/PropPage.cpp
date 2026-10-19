@@ -205,6 +205,7 @@ HRESULT CVRMainPPage::OnDisconnect()
 	}
 
 	m_pVideoRenderer.Release();
+	m_pAmbilightConfig.Release();
 
 	return S_OK;
 }
@@ -216,6 +217,17 @@ HRESULT CVRMainPPage::OnActivate()
 
 	m_pVideoRenderer->GetSettings(m_SetsPP);
 	m_oldSDRDisplayNits = m_SetsPP.iSDRDisplayNits;
+	m_pAmbilightConfig = m_pVideoRenderer;
+	bool ambilight = false;
+	int intensity = 35, blur = 50;
+	if (m_pAmbilightConfig) {
+		m_pAmbilightConfig->Flt_GetBool("ambilightEnabled", &ambilight);
+		m_pAmbilightConfig->Flt_GetInt("ambilightIntensity", &intensity);
+		m_pAmbilightConfig->Flt_GetInt("ambilightBlur", &blur);
+	}
+	CheckDlgButton(IDC_AMBILIGHT_ENABLE, ambilight ? BST_CHECKED : BST_UNCHECKED);
+	SetDlgItemInt(IDC_AMBILIGHT_INTENSITY, intensity, FALSE);
+	SetDlgItemInt(IDC_AMBILIGHT_BLUR, blur, FALSE);
 
 	if (!IsWindows7SP1OrGreater()) {
 		GetDlgItem(IDC_CHECK1).EnableWindow(FALSE);
@@ -366,6 +378,21 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 		LRESULT lValue;
 		const int nID = LOWORD(wParam);
 		int action = HIWORD(wParam);
+		if ((nID == IDC_AMBILIGHT_ENABLE && action == BN_CLICKED)
+				|| ((nID == IDC_AMBILIGHT_INTENSITY || nID == IDC_AMBILIGHT_BLUR) && action == EN_CHANGE)) {
+			if (m_bActivated && m_pAmbilightConfig) {
+				if (nID == IDC_AMBILIGHT_ENABLE) {
+					m_pAmbilightConfig->Flt_SetBool("ambilightEnabled", IsDlgButtonChecked(nID) == BST_CHECKED);
+				} else {
+					BOOL valid = FALSE;
+					UINT value = GetDlgItemInt(nID, &valid, FALSE);
+					if (valid && value <= 100) m_pAmbilightConfig->Flt_SetInt(nID == IDC_AMBILIGHT_BLUR ? "ambilightBlur" : "ambilightIntensity", value);
+				}
+				m_pAmbilightConfig->Flt_SetBool("ambilightSave", true);
+			}
+			SetDirty();
+			return (LRESULT)1;
+		}
 
 		if (action == BN_CLICKED) {
 			if (nID == IDC_CHECK1) {
@@ -471,6 +498,9 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 
 			if (nID == IDC_BUTTON1) {
 				m_SetsPP.SetDefault();
+				CheckDlgButton(IDC_AMBILIGHT_ENABLE, BST_UNCHECKED);
+				SetDlgItemInt(IDC_AMBILIGHT_INTENSITY, 35, FALSE);
+				SetDlgItemInt(IDC_AMBILIGHT_BLUR, 50, FALSE);
 				SetControls();
 				EnableControls();
 				SetDirty();
@@ -659,6 +689,18 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 
 HRESULT CVRMainPPage::OnApplyChanges()
 {
+	BOOL intensityValid = FALSE, blurValid = FALSE;
+	UINT intensity = GetDlgItemInt(IDC_AMBILIGHT_INTENSITY, &intensityValid, FALSE);
+	UINT blur = GetDlgItemInt(IDC_AMBILIGHT_BLUR, &blurValid, FALSE);
+	if (!intensityValid || !blurValid || intensity > 100 || blur > 100) {
+		MessageBoxW(L"Ambilight intensity and blur must be numbers from 0 to 100.", L"Ambilight", MB_OK | MB_ICONERROR);
+		return E_INVALIDARG;
+	}
+	if (m_pAmbilightConfig) {
+		m_pAmbilightConfig->Flt_SetInt("ambilightIntensity", intensity);
+		m_pAmbilightConfig->Flt_SetInt("ambilightBlur", blur);
+		m_pAmbilightConfig->Flt_SetBool("ambilightEnabled", IsDlgButtonChecked(IDC_AMBILIGHT_ENABLE) == BST_CHECKED);
+	}
 	BOOL translated = FALSE;
 	int displayMaxNits = GetDlgItemInt(IDC_EDIT_DISPLAYMAX, &translated, FALSE);
 	if (!translated) {

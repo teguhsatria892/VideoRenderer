@@ -25,6 +25,7 @@
 #include <thread>
 #include "renbase2.h"
 #include "IVideoRenderer.h"
+#include "Ambilight.h"
 #include "DX9VideoProcessor.h"
 #include "DX11VideoProcessor.h"
 #include <ISubRender.h>
@@ -97,6 +98,7 @@ private:
 
 	// Options
 	Settings_t m_Sets;
+	AmbilightSettings m_Ambilight;
 
 	FILTER_STATE m_filterState = State_Stopped;
 	bool m_bFlushing = false;
